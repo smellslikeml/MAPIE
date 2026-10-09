@@ -119,6 +119,15 @@ jobs:
     env:
       REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
     steps:
+      # Workaround: the outrider action installs poppler-utils (pdftotext) without a
+      # prior `apt-get update`; when the hosted-runner image's apt index is stale the
+      # pinned poppler patch version 404s on the mirror and fails the whole run. Refresh
+      # the lists (and pre-install) up front so the action's install resolves cleanly.
+      - name: Refresh apt lists + pre-install poppler-utils
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils || true
       # Mint a remyx[bot] token from Remyx so the PR / Issue is authored by
       # the Remyx GitHub App (not github-actions[bot]). The App private key
       # stays on Remyx's side; this uses the REMYX_API_KEY already in secrets.
