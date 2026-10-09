@@ -10,7 +10,7 @@ from sklearn.datasets import make_regression
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import KFold, LeaveOneOut, train_test_split
 from sklearn.utils.estimator_checks import check_estimator
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from mapie.aggregation_functions import aggregate_all
 from mapie.conformity_scores import AbsoluteConformityScore
@@ -29,7 +29,7 @@ X, y = make_regression(
     n_samples=500, n_features=10, noise=1.0, random_state=random_state
 )
 k = np.ones(shape=(5, X.shape[1]))
-METHODS = ["enbpi", "aci"]
+METHODS = ["enbpi", "aci", "spci"]
 UPDATE_DATA = ([6], 17.5)
 CONFORMITY_SCORES = [14.189 - 14.038, 17.5 - 18.665]
 
@@ -39,6 +39,7 @@ Params = TypedDict(
         "method": str,
         "agg_function": str,
         "cv": Optional[Union[int, KFold, BlockBootstrap]],
+        "random_state": NotRequired[int],
     },
 )
 STRATEGIES = {
@@ -72,6 +73,12 @@ STRATEGIES = {
         agg_function="median",
         cv=BlockBootstrap(n_resamplings=30, n_blocks=5, random_state=random_state),
     ),
+    "blockbootstrap_spci_mean": Params(
+        method="spci",
+        agg_function="mean",
+        cv=BlockBootstrap(n_resamplings=30, n_blocks=5, random_state=random_state),
+        random_state=random_state,
+    ),
 }
 
 WIDTHS = {
@@ -81,6 +88,7 @@ WIDTHS = {
     "blockbootstrap_enbpi_median": 3.85,
     "blockbootstrap_aci_mean": 3.89,  # same as enbpi
     "blockbootstrap_aci_median": 3.85,  # same as enbpi
+    "blockbootstrap_spci_mean": 4.02,
     "prefit": 4.86,
 }
 
@@ -91,6 +99,7 @@ COVERAGES = {
     "blockbootstrap_enbpi_median": 0.956,
     "blockbootstrap_aci_mean": 0.956,
     "blockbootstrap_aci_median": 0.956,
+    "blockbootstrap_spci_mean": 0.966,
     "prefit": 0.97,
 }
 
@@ -485,10 +494,10 @@ def test_method_error_in_update(monkeypatch: Any, method: str) -> None:
         mapie_ts_reg.update(X_toy, y_toy)
 
 
-@pytest.mark.parametrize("method", ["enbpi", "aci"])
+@pytest.mark.parametrize("method", ["enbpi", "aci", "spci"])
 @pytest.mark.parametrize("cv", ["split", "prefit"])
 def test_methods_preservation_in_fit(method: str, cv: str) -> None:
-    """Test of enbpi and aci method preservation in the fit _MapieRegressor"""
+    """Test of enbpi, aci and spci method preservation in the fit _MapieRegressor"""
 
     X_train_val, X_test, y_train_val, y_test = train_test_split(
         X, y, test_size=0.33, random_state=random_state
@@ -511,3 +520,119 @@ def test_sample_weight_as_top_level_kwarg_raises() -> None:
     )
     with pytest.raises(TypeError, match="fit_params"):
         mapie_ts_reg.fit(X, y, sample_weight=np.ones(len(X)))
+
+
+def _autocorrelated_heteroscedastic_series(
+    n_samples: int, seed: int
+) -> Tuple[NDArray, NDArray]:
+    """
+    Generate a time series whose noise is an AR(1) process with a slowly
+    oscillating scale: the noise is serially correlated and locally
+    heteroscedastic, while its marginal distribution is stationary.
+    """
+    rng = np.random.default_rng(seed)
+    t = np.arange(n_samples, dtype=float)
+    X = np.column_stack([t / n_samples, np.sin(2 * np.pi * t / 50.0)])
+    ar = np.zeros(n_samples)
+    innovations = rng.normal(size=n_samples)
+    for i in range(1, n_samples):
+        ar[i] = 0.9 * ar[i - 1] + innovations[i]
+    scale = 0.6 + 0.4 * (1.0 + np.sin(2 * np.pi * t / 80.0))
+    y = X @ np.array([10.0, 5.0]) + scale * ar
+    return X, y
+
+
+def test_spci_sequential_coverage_and_efficiency() -> None:
+    """
+    Test that SPCI, used sequentially (predict one test point at a time,
+    then update the residuals with the observed value), reaches the target
+    coverage on a serially correlated and locally heteroscedastic time
+    series, with tighter intervals than a fixed-width EnbPI baseline
+    (EnbPI fitted once, without online update).
+    """
+    n_train, n_test, confidence_level = 400, 150, 0.9
+    X_series, y_series = _autocorrelated_heteroscedastic_series(
+        n_train + n_test, seed=42
+    )
+    X_train, y_train = X_series[:n_train], y_series[:n_train]
+    X_test, y_test = X_series[n_train:], y_series[n_train:]
+
+    mapie_spci = TimeSeriesRegressor(
+        method="spci", cv=-1, random_state=0
+    ).fit(X_train, y_train)
+    covered, widths = 0, []
+    for x_row, y_row in zip(X_test, y_test):
+        _, y_pis = mapie_spci.predict(
+            x_row[np.newaxis, :], confidence_level=confidence_level
+        )
+        covered += int(y_pis[0, 0, 0] <= y_row <= y_pis[0, 1, 0])
+        widths.append(y_pis[0, 1, 0] - y_pis[0, 0, 0])
+        mapie_spci.update(x_row[np.newaxis, :], np.array([y_row]))
+    spci_coverage = covered / n_test
+    spci_width = float(np.mean(widths))
+
+    mapie_enbpi = TimeSeriesRegressor(method="enbpi", cv=-1).fit(X_train, y_train)
+    _, y_pis = mapie_enbpi.predict(X_test, confidence_level=confidence_level)
+    enbpi_coverage = regression_coverage_score(y_test, y_pis)[0]
+    enbpi_width = float((y_pis[:, 1, 0] - y_pis[:, 0, 0]).mean())
+
+    np.testing.assert_allclose(spci_coverage, confidence_level, atol=0.05)
+    assert spci_coverage >= enbpi_coverage
+    assert spci_width < enbpi_width
+
+
+@pytest.mark.parametrize(
+    "spci_params",
+    [
+        {"spci_window": 0},
+        {"spci_window": 2.5},
+        {"spci_refit_every": 0},
+        {"spci_refit_every": 1.5},
+    ],
+)
+def test_spci_invalid_parameters(spci_params: Any) -> None:
+    """Test that invalid SPCI parameters raise errors."""
+    mapie_ts_reg = TimeSeriesRegressor(method="spci", **spci_params)
+    with pytest.raises(ValueError, match=r".*Invalid spci_.*"):
+        mapie_ts_reg.fit(X_toy, y_toy)
+
+
+def test_spci_parameters_only_with_spci_method() -> None:
+    """Test that SPCI parameters are refused with other methods."""
+    mapie_ts_reg = TimeSeriesRegressor(method="enbpi", spci_window=10)
+    with pytest.raises(ValueError, match=r".*can be used only with method*"):
+        mapie_ts_reg.fit(X_toy, y_toy)
+
+
+def test_spci_not_enough_residuals() -> None:
+    """Test that SPCI raises an error with less than two finite residuals."""
+    mapie_ts_reg = TimeSeriesRegressor(method="spci", cv=-1).fit(X_toy, y_toy)
+    mapie_ts_reg.conformity_scores_ = np.array([1.0])
+    with pytest.raises(ValueError, match=r".*at least two finite conformity*"):
+        mapie_ts_reg._fit_spci_residual_forest()
+
+
+def test_spci_update_refit_cadence(monkeypatch: Any) -> None:
+    """Test that the residual forest is refitted every `spci_refit_every`."""
+    calls: list = []
+    monkeypatch.setattr(
+        TimeSeriesRegressor,
+        "_fit_spci_residual_forest",
+        lambda self: calls.append(1),
+    )
+    mapie_ts_reg = TimeSeriesRegressor(method="spci", cv=-1, spci_refit_every=2)
+    mapie_ts_reg.fit(X_toy, y_toy)
+    assert len(calls) == 1  # initial fit
+    mapie_ts_reg.update(X_toy[:1], y_toy[:1])
+    assert len(calls) == 1  # first update: too early to refit
+    mapie_ts_reg.update(X_toy[:1], y_toy[:1])
+    assert len(calls) == 2  # second update: the forest is refitted
+    assert mapie_ts_reg.n_updates_ == 2
+
+
+def test_spci_predict_with_optimize_beta() -> None:
+    """Test that `optimize_beta` is accepted (and ignored) by SPCI."""
+    mapie_ts_reg = TimeSeriesRegressor(method="spci", cv=-1, random_state=1)
+    mapie_ts_reg.fit(X_toy, y_toy)
+    _, y_pis = mapie_ts_reg.predict(X_toy, confidence_level=0.5, optimize_beta=True)
+    assert y_pis.shape == (len(X_toy), 2, 1)
