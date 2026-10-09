@@ -200,6 +200,35 @@ electricity demand.
 
 ---
 
+## 11. SPCI (Sequential Predictive Conformal Inference)
+
+For **time series with serially dependent residuals**, SPCI learns the
+dependence instead of assuming it away:
+
+$$
+\hat{C}_{n, \alpha}^{\text{SPCI}}(X_{n+1}) = \left[\hat{\mu}(X_{n+1}) + \hat{Q}(\beta), \hat{\mu}(X_{n+1}) + \hat{Q}(1-\alpha+\beta)\right]
+$$
+
+where $\hat{Q}$ is the conditional quantile of the next residual given the
+$w$ most recent residuals, estimated by a **quantile random forest**
+(a scikit-learn `RandomForestRegressor` whose leaf aggregation pools the
+training residuals sharing a leaf with the query window — no additional
+dependency), and $\beta \in [0, \alpha]$ is chosen to **minimize the interval
+width**.
+
+Key features:
+
+- Available in `TimeSeriesRegressor` as `method="spci"`, with the window
+  length (`spci_window`) and the residual forest refitting frequency
+  (`spci_refit_every`, in number of calls to `update`) as parameters.
+- Because the serial dependence of the residuals is learned, the intervals
+  are typically **tighter than EnbPI at a similar coverage level**.
+- As new observations arrive, `update` appends the new residuals and
+  periodically refits the residual forest so that the intervals track the
+  stream.
+
+---
+
 ## Key Takeaways
 
 | Feature | Recommendation |
@@ -208,7 +237,7 @@ electricity demand.
 | Large datasets | **CV+** or **Jackknife+-after-bootstrap** |
 | Conservative estimates | **Jackknife-minmax** / **CV-minmax** |
 | Heteroscedastic data | **CQR** |
-| Time series | **EnbPI** |
+| Time series | **EnbPI** / **SPCI** |
 
 ### Method Comparison
 
