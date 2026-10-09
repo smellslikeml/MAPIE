@@ -1,6 +1,13 @@
 # History
 ## 1.x.x (2026-xx-xx)
 
+- Add `method="spci"` (Sequential Predictive Conformal Inference) to
+  `TimeSeriesRegressor`: prediction intervals built from a quantile random
+  forest (scikit-learn `RandomForestRegressor` with leaf aggregation, no new
+  dependency) fitted on windows of past residuals, with a width-optimized
+  quantile offset and periodic online refitting (`spci_window` and
+  `spci_refit_every` parameters). Clean-room implementation from
+  Xu & Xie (ICML 2023). (issue #370)
 - Add educational MAPIE notebooks covering regression and conformal prediction
   for language models. Shown in the documentation homepage and All Examples.
 - Fix `_compute_classification_quantile` to select the intended split-conformal
